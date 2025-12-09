@@ -22,4 +22,4 @@ mkdir -p "$SCRIPT_DIR/audio"
 # t_w（similarity weight）：约 2.0–5.0；越大更偏向说话人相似性。
 PYTHONPATH="$REPO_ROOT" python "$REPO_ROOT/tts/infer_cli.py" --input_wav "${REPO_ROOT}/assets/Chinese_prompt.wav" \
   --input_text "$(cat "$SPEECH_FILE")" --output_dir "${SCRIPT_DIR}/audio" \
-  # --p_w 2.0 --t_w 3.5
+  --p_w 1.0 --t_w 2.5
