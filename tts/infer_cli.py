@@ -15,9 +15,11 @@
 import json
 import os
 import argparse
+import time
 import librosa
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from tn.chinese.normalizer import Normalizer as ZhNormalizer
 from tn.english.normalizer import Normalizer as EnNormalizer
@@ -63,7 +65,7 @@ def cut_wav(wav_path, max_len=28):
 
 class MegaTTS3DiTInfer():
     def __init__(
-            self, 
+            self,
             device=None,
             ckpt_root='./checkpoints',
             dit_exp_name='diffusion_transformer',
@@ -159,11 +161,15 @@ class MegaTTS3DiTInfer():
         self.wavvae.to(device)
         self.vae_stride = hp_wavvae.get('vae_stride', 4)
         self.hop_size = hp_wavvae.get('hop_size', 4)
-    
+
     def preprocess(self, audio_bytes, latent_file=None, topk_dur=1, **kwargs):
+        preprocess_start_time = time.time()
+        print(f"[PREPROCESS] 开始预处理音频 - {time.strftime('%H:%M:%S')}")
+
         wav_bytes = convert_to_wav_bytes(audio_bytes)
 
         ''' Load wav '''
+        wav_load_start = time.time()
         wav, _ = librosa.core.load(wav_bytes, sr=self.sr)
         # Pad wav if necessary
         ws = hparams['win_size']
@@ -171,12 +177,18 @@ class MegaTTS3DiTInfer():
             wav = np.pad(wav, (0, ws - 1 - (len(wav) % ws)), mode='constant', constant_values=0.0).astype(np.float32)
         wav = np.pad(wav, (0, 12000), mode='constant', constant_values=0.0).astype(np.float32)
         self.loudness_prompt = self.loudness_meter.integrated_loudness(wav.astype(float))
+        wav_load_time = time.time() - wav_load_start
+        print(f"[PREPROCESS] 音频加载完成 - 耗时: {wav_load_time:.2f}秒")
 
         ''' obtain alignments with aligner_lm '''
+        align_start = time.time()
         ph_ref, tone_ref, mel2ph_ref = align(self, wav)
+        align_time = time.time() - align_start
+        print(f"[PREPROCESS] 对齐处理完成 - 耗时: {align_time:.2f}秒")
 
         with torch.inference_mode():
             ''' Forward WaveVAE to obtain: prompt latent '''
+            vae_start = time.time()
             if self.has_vae_encoder:
                 wav = torch.FloatTensor(wav)[None].to(self.device)
                 vae_latent = self.wavvae.encode_latent(wav)
@@ -185,11 +197,19 @@ class MegaTTS3DiTInfer():
                 assert latent_file is not None, "Please provide latent_file in WaveVAE decoder-only mode"
                 vae_latent = torch.from_numpy(np.load(latent_file)).to(self.device)
                 vae_latent = vae_latent[:, :mel2ph_ref.size(1)//4]
-        
+            vae_time = time.time() - vae_start
+            print(f"[PREPROCESS] VAE编码完成 - 耗时: {vae_time:.2f}秒")
+
             ''' Duration Prompting '''
             self.dur_model.hparams["infer_top_k"] = topk_dur if topk_dur > 1 else None
+            dur_prompt_start = time.time()
             incremental_state_dur_prompt, ctx_dur_tokens = make_dur_prompt(self, mel2ph_ref, ph_ref, tone_ref)
-            
+            dur_prompt_time = time.time() - dur_prompt_start
+            print(f"[PREPROCESS] 时长预测提示完成 - 耗时: {dur_prompt_time:.2f}秒")
+
+        preprocess_total_time = time.time() - preprocess_start_time
+        print(f"[PREPROCESS] 预处理全部完成 - 总耗时: {preprocess_total_time:.2f}秒")
+
         return {
             'ph_ref': ph_ref,
             'tone_ref': tone_ref,
@@ -200,6 +220,9 @@ class MegaTTS3DiTInfer():
         }
 
     def forward(self, resource_context, input_text, time_step, p_w, t_w, dur_disturb=0.1, dur_alpha=1.0, **kwargs):
+        forward_start_time = time.time()
+        print(f"[FORWARD] 开始音频生成 - {time.strftime('%H:%M:%S')}")
+
         device = self.device
 
         ph_ref = resource_context['ph_ref'].to(device)
@@ -220,23 +243,44 @@ class MegaTTS3DiTInfer():
                 input_text = self.zh_normalizer.normalize(input_text)
                 text_segs = chunk_text_chinesev2(input_text, limit=60)
 
-            for seg_i, text in enumerate(text_segs):
+            print(f"[FORWARD] 文本已分段，共 {len(text_segs)} 段")
+            print(f"[FORWARD] 语言检测结果: {language_type}")
+            print(f"[FORWARD] 开始处理文本分段...")
+
+            # 使用tqdm显示进度条
+            for seg_i, text in enumerate(tqdm(text_segs, desc="处理文本段", unit="段")):
+                seg_start_time = time.time()
+                print(f"[FORWARD] 正在处理第 {seg_i+1}/{len(text_segs)} 段: '{text[:30]}...'")
+
                 ''' G2P '''
+                g2p_start = time.time()
                 ph_pred, tone_pred = g2p(self, text)
+                g2p_time = time.time() - g2p_start
+                print(f"[FORWARD]   G2P转换完成 - 耗时: {g2p_time:.2f}秒")
 
                 ''' Duration Prediction '''
+                dur_start = time.time()
                 mel2ph_pred = dur_pred(self, ctx_dur_tokens, incremental_state_dur_prompt, ph_pred, tone_pred, seg_i, dur_disturb, dur_alpha, is_first=seg_i==0, is_final=seg_i==len(text_segs)-1)
-                
+                dur_time = time.time() - dur_start
+                print(f"[FORWARD]   时长预测完成 - 耗时: {dur_time:.2f}秒")
+
                 inputs = prepare_inputs_for_dit(self, mel2ph_ref, mel2ph_pred, ph_ref, tone_ref, ph_pred, tone_pred, vae_latent)
                 # Speech dit inference
+                dit_start = time.time()
                 with torch.cuda.amp.autocast(dtype=self.precision, enabled=True):
                     x = self.dit.inference(inputs, timesteps=time_step, seq_cfg_w=[p_w, t_w]).float()
-                
+                dit_time = time.time() - dit_start
+                print(f"[FORWARD]   DiT推理完成 - 耗时: {dit_time:.2f}秒")
+
                 # WavVAE decode
+                vae_decode_start = time.time()
                 x[:, :vae_latent.size(1)] = vae_latent
                 wav_pred = self.wavvae.decode(x)[0,0].to(torch.float32)
-                
+                vae_decode_time = time.time() - vae_decode_start
+                print(f"[FORWARD]   VAE解码完成 - 耗时: {vae_decode_time:.2f}秒")
+
                 ''' Post-processing '''
+                post_start = time.time()
                 # Trim prompt wav
                 wav_pred = wav_pred[vae_latent.size(1)*self.vae_stride*self.hop_size:].cpu().numpy()
                 # Norm generated wav to prompt wav's level
@@ -245,12 +289,21 @@ class MegaTTS3DiTInfer():
                 wav_pred = pyln.normalize.loudness(wav_pred, loudness_pred, self.loudness_prompt)
                 if np.abs(wav_pred).max() >= 1:
                     wav_pred = wav_pred / np.abs(wav_pred).max() * 0.95
+                post_time = time.time() - post_start
+                print(f"[FORWARD]   后处理完成 - 耗时: {post_time:.2f}秒")
 
                 # Apply hamming window
                 wav_pred_.append(wav_pred)
 
+                seg_total_time = time.time() - seg_start_time
+                print(f"[FORWARD]   第 {seg_i+1} 段处理完成 - 段耗时: {seg_total_time:.2f}秒")
+
             wav_pred = combine_audio_segments(wav_pred_, sr=self.sr).astype(float)
-            return to_wav_bytes(wav_pred, self.sr)
+
+        forward_total_time = time.time() - forward_start_time
+        print(f"[FORWARD] 音频生成全部完成 - 总耗时: {forward_total_time:.2f}秒")
+
+        return to_wav_bytes(wav_pred, self.sr)
 
 
 if __name__ == '__main__':
@@ -264,15 +317,36 @@ if __name__ == '__main__':
     args = parser.parse_args()
     wav_path, input_text, out_path, time_step, p_w, t_w = args.input_wav, args.input_text, args.output_dir, args.time_step, args.p_w, args.t_w
 
+    print("="*80)
+    print("MegaTTS3 音频生成开始")
+    print("="*80)
+    print(f"输入音频: {wav_path}")
+    print(f"输入文本: {input_text}")
+    print(f"输出目录: {out_path}")
+    print(f"推理步数: {time_step}")
+    print(f"清晰度权重: {p_w}")
+    print(f"相似度权重: {t_w}")
+    print("="*80)
+
+    start_time = time.time()
+
     infer_ins = MegaTTS3DiTInfer()
 
     with open(wav_path, 'rb') as file:
         file_content = file.read()
 
-    print(f"| Start processing {wav_path}+{input_text}")
+    print(f"[MAIN] 开始处理 {wav_path}+{input_text}")
     resource_context = infer_ins.preprocess(file_content, latent_file=wav_path.replace('.wav', '.npy'))
     wav_bytes = infer_ins.forward(resource_context, input_text, time_step=time_step, p_w=p_w, t_w=t_w)
 
-    print(f"| Saving results to {out_path}/[P]{input_text[:20]}.wav")
+    print(f"[MAIN] 保存结果到 {out_path}/[P]{input_text[:20]}.wav")
     os.makedirs(out_path, exist_ok=True)
     save_wav(wav_bytes, f'{out_path}/[P]{input_text[:20]}.wav')
+
+    total_time = time.time() - start_time
+    print("="*80)
+    print(f"音频生成完成！")
+    print(f"总耗时: {total_time:.2f}秒 ({total_time/60:.2f}分钟)")
+    print(f"开始时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}")
+    print(f"结束时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("="*80)
