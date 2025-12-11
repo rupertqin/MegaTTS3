@@ -13,6 +13,7 @@ import argparse
 import time
 from pathlib import Path
 from tqdm import tqdm
+import wave
 
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -158,13 +159,17 @@ class IncrementalTTSGenerator:
 
             print(f"   ✅ 完成 - 耗时: {generation_time:.1f}秒")
 
+            # 获取音频时长
+            duration = self.get_audio_duration(output_path)
+
             return {
                 'status': 'success',
                 'text': text,
                 'output_path': output_path,
                 'filename': filename,
                 'index': index,
-                'generation_time': generation_time
+                'generation_time': generation_time,
+                'duration': duration
             }
 
         except Exception as e:
@@ -179,6 +184,18 @@ class IncrementalTTSGenerator:
                 'index': index,
                 'error': str(e)
             }
+
+    def get_audio_duration(self, audio_path):
+        """获取音频文件时长（秒）"""
+        try:
+            with wave.open(audio_path, 'rb') as audio_file:
+                frames = audio_file.getnframes()
+                rate = audio_file.getframerate()
+                duration = frames / float(rate)
+                return duration
+        except Exception as e:
+            print(f"⚠️  获取音频时长失败: {e}")
+            return 0.0
 
     def normalize_text_for_matching(self, text):
         """标准化文本用于匹配：去除所有标点和空格"""
@@ -244,12 +261,15 @@ class IncrementalTTSGenerator:
             if os.path.exists(output_path) and not force_regenerate:
                 print(f"⏭️  跳过已存在的文件: {filename}")
                 print(f"   📝 文本: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+                # 获取已存在文件的时长
+                duration = self.get_audio_duration(output_path)
                 results.append({
                     'status': 'skipped',
                     'text': sentence,
                     'output_path': output_path,
                     'filename': filename,
-                    'index': i+1
+                    'index': i+1,
+                    'duration': duration
                 })
                 continue
 
@@ -299,12 +319,15 @@ class IncrementalTTSGenerator:
             if os.path.exists(output_path) and not force_regenerate:
                 print(f"⏭️  跳过已存在的文件: {filename}")
                 print(f"   📝 文本: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+                # 获取已存在文件的时长
+                duration = self.get_audio_duration(output_path)
                 results.append({
                     'status': 'skipped',
                     'text': sentence,
                     'output_path': output_path,
                     'filename': filename,
-                    'index': i+1
+                    'index': i+1,
+                    'duration': duration
                 })
                 continue
 
@@ -350,6 +373,270 @@ class IncrementalTTSGenerator:
         print(f"   ⏭️  跳过: {report['summary']['skipped']}")
         print(f"   ❌ 失败: {report['summary']['failed']}")
         print(f"   📄 报告保存: {report_path}")
+
+def generate_srt_files(output_dir, gap_ms=500):
+    """
+    根据 generation_report.json 生成 SRT 字幕文件
+    为每个音频片段生成独立的 SRT 文件，并生成合并的 SRT 文件
+    """
+    print("📝 开始生成 SRT 字幕文件...")
+
+    # 读取 generation_report.json
+    report_path = os.path.join(output_dir, 'generation_report.json')
+    if not os.path.exists(report_path):
+        print(f"❌ 未找到生成报告: {report_path}")
+        print("   请先运行生成步骤")
+        return None
+
+    try:
+        with open(report_path, 'r', encoding='utf-8') as f:
+            report = json.load(f)
+    except Exception as e:
+        print(f"❌ 读取报告文件失败: {e}")
+        return None
+
+    # 从报告中提取成功生成的音频文件
+    subtitle_entries = []
+    for result in report.get('results', []):
+        if result['status'] in ['success', 'skipped'] and result.get('output_path'):
+            file_path = result['output_path']
+            if os.path.exists(file_path):
+                # 优先使用报告中的 duration，如果没有则动态计算
+                duration = result.get('duration')
+                if duration is None or duration == 0.0:
+                    # 动态计算音频时长
+                    try:
+                        with wave.open(file_path, 'rb') as audio_file:
+                            frames = audio_file.getnframes()
+                            rate = audio_file.getframerate()
+                            duration = frames / float(rate)
+                    except Exception as e:
+                        print(f"⚠️  无法获取音频时长: {result['filename']}, 错误: {e}")
+                        duration = 3.0  # 默认 3 秒
+
+                subtitle_entries.append({
+                    'index': result['index'],
+                    'text': result['text'],
+                    'filename': result['filename'],
+                    'duration': duration
+                })
+            else:
+                print(f"⚠️  文件不存在，跳过: {result['filename']}")
+
+    if not subtitle_entries:
+        print("❌ 没有找到可生成字幕的音频文件")
+        return None
+
+    print(f"📁 从报告中找到 {len(subtitle_entries)} 个音频文件")
+
+    # 生成单独的 SRT 文件
+    for entry in subtitle_entries:
+        srt_filename = entry['filename'].replace('.wav', '.srt')
+        srt_path = os.path.join(output_dir, srt_filename)
+
+        # 将文本分割成多行（每行不超过15个字）
+        subtitle_lines = split_subtitle_text(entry['text'], max_chars=15)
+
+        # 计算每行的时长（平均分配）
+        total_duration = entry['duration']
+        line_duration = total_duration / len(subtitle_lines) if subtitle_lines else total_duration
+
+        # 生成 SRT 内容
+        srt_content = ""
+        for i, line in enumerate(subtitle_lines, start=1):
+            start_time = format_srt_time((i - 1) * line_duration)
+            end_time = format_srt_time(i * line_duration)
+            srt_content += f"{i}\n{start_time} --> {end_time}\n{line}\n\n"
+
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            f.write(srt_content)
+
+        print(f"✅ 生成字幕: {srt_filename} ({len(subtitle_lines)} 行)")
+
+    # 生成合并的 SRT 文件
+    merged_srt_path = os.path.join(output_dir, "merged_subtitles.srt")
+    gap_seconds = gap_ms / 1000.0
+    current_time = 0.0
+    subtitle_index = 1
+
+    with open(merged_srt_path, 'w', encoding='utf-8') as f:
+        for entry in subtitle_entries:
+            # 将文本分割成多行（每行不超过15个字）
+            subtitle_lines = split_subtitle_text(entry['text'], max_chars=15)
+
+            # 计算每行的时长（平均分配）
+            total_duration = entry['duration']
+            line_duration = total_duration / len(subtitle_lines) if subtitle_lines else total_duration
+
+            # 为每一行生成字幕条目
+            for line in subtitle_lines:
+                start_time = format_srt_time(current_time)
+                end_time = format_srt_time(current_time + line_duration)
+
+                f.write(f"{subtitle_index}\n")
+                f.write(f"{start_time} --> {end_time}\n")
+                f.write(f"{line}\n\n")
+
+                subtitle_index += 1
+                current_time += line_duration
+
+            # 添加间隔时间（在句子之间）
+            current_time += gap_seconds
+
+    print(f"\n✅ SRT 字幕生成完成!")
+    print(f"📁 合并字幕文件: {merged_srt_path}")
+    print(f"📊 音频片段数: {len(subtitle_entries)}")
+    print(f"📊 字幕条目数: {subtitle_index - 1}")
+
+    return merged_srt_path
+
+def count_chars_without_punctuation(text):
+    """计算文本字符数，不包括标点符号"""
+    import re
+    clean_text = re.sub(r'[，。！？；：、,\.!?;:"""''「」『』（）\(\)\s]', '', text)
+    return len(clean_text)
+
+def split_subtitle_text(text, max_chars=15, min_chars=10):
+    """
+    将长文本分割成多个字幕行
+    - 按标点符号分割（不包括引号）
+    - 每行不超过 max_chars 个字符（不计标点）
+    - 优先在"的"、"地"、"得"等助词处断开
+    - 引号不计入字符数
+    """
+    import re
+
+    # 只按这些标点分割，不包括引号
+    segments = re.split(r'[，。！？；：、,\.!?;:]', text)
+
+    # 去除空白片段
+    segments = [s.strip() for s in segments if s.strip()]
+
+    if not segments:
+        return []
+
+    # 第一步：合并过短的片段
+    merged = []
+    i = 0
+    while i < len(segments):
+        current = segments[i]
+        current_len = count_chars_without_punctuation(current)
+
+        while current_len < min_chars and i + 1 < len(segments):
+            next_text = segments[i + 1]
+            combined = current + next_text
+            combined_len = count_chars_without_punctuation(combined)
+
+            if combined_len <= max_chars:
+                i += 1
+                current = combined
+                current_len = combined_len
+            else:
+                break
+
+        merged.append(current)
+        i += 1
+
+    # 第二步：智能分割超长片段
+    def find_best_split_point(text_part, target_len, min_len):
+        """找到最佳分割点"""
+        priority_chars = ['的', '地', '得', '了', '着', '过']
+        secondary_chars = ['是', '在', '和', '与', '或', '及', '把', '被']
+
+        # 计算每个位置的实际字符数
+        positions = []
+        count = 0
+        for c in text_part:
+            if not re.match(r'[，。！？；：、,\.!?;:"""''「」『』（）\(\)\s]', c):
+                count += 1
+            positions.append(count)
+
+        best_pos = -1
+        best_score = -1000
+
+        for i in range(len(text_part)):
+            curr_len = positions[i]
+            remain_len = count - curr_len
+
+            if curr_len < min_len or curr_len > target_len:
+                continue
+
+            score = 0
+
+            # 下一个字符是优先字符，加分
+            if i + 1 < len(text_part) and text_part[i + 1] in priority_chars:
+                score += 15
+            elif i + 1 < len(text_part) and text_part[i + 1] in secondary_chars:
+                score += 8
+
+            # 越接近目标长度越好
+            score -= abs(curr_len - target_len)
+
+            # 剩余部分的长度评分
+            if remain_len >= min_len:
+                score += 5
+            elif remain_len > 0:
+                score -= (min_len - remain_len) * 3
+
+            if score > best_score:
+                best_score = score
+                best_pos = i + 1
+
+        return best_pos if best_pos > 0 else min(target_len, len(text_part))
+
+    split_lines = []
+    for part in merged:
+        part_len = count_chars_without_punctuation(part)
+
+        if part_len <= max_chars:
+            split_lines.append(part)
+        else:
+            # 超长片段需要智能分割
+            remaining = part
+
+            while remaining:
+                remaining_len = count_chars_without_punctuation(remaining)
+
+                if remaining_len <= max_chars:
+                    split_lines.append(remaining)
+                    break
+
+                # 找到最佳分割点
+                best_pos = find_best_split_point(remaining, max_chars, min_chars)
+
+                if best_pos > 0 and best_pos < len(remaining):
+                    split_lines.append(remaining[:best_pos].strip())
+                    remaining = remaining[best_pos:].strip()
+                else:
+                    split_lines.append(remaining)
+                    break
+
+    # 第三步：合并过短的片段
+    final_lines = []
+    for part in split_lines:
+        part_len = count_chars_without_punctuation(part)
+
+        if part_len < min_chars and final_lines:
+            prev_len = count_chars_without_punctuation(final_lines[-1])
+            combined_len = prev_len + part_len
+
+            if combined_len <= max_chars:
+                final_lines[-1] = final_lines[-1] + part
+            else:
+                final_lines.append(part)
+        else:
+            final_lines.append(part)
+
+    return final_lines
+
+
+def format_srt_time(seconds):
+    """将秒数转换为 SRT 时间格式 (HH:MM:SS,mmm)"""
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int((seconds % 1) * 1000)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
 
 def merge_audio_files(output_dir, output_filename="merged_audio.wav", gap_ms=500):
     """
@@ -446,9 +733,18 @@ def main():
     parser.add_argument('--force', action='store_true', help='强制重新生成已存在的文件')
     parser.add_argument('--merge_only', action='store_true', help='仅执行音频合并（根据generation_report.json）')
     parser.add_argument('--merge_gap', type=int, default=500, help='合并时的静音间隔(ms)')
+    parser.add_argument('--srt_only', action='store_true', help='仅生成 SRT 字幕文件（根据generation_report.json）')
 
     # 解析参数
     args = parser.parse_args()
+
+    if args.srt_only:
+        # 仅生成 SRT 字幕
+        if not args.output_dir:
+            parser.error("--output_dir 在 SRT 生成模式下是必需的")
+
+        result = generate_srt_files(args.output_dir, args.merge_gap)
+        return
 
     if args.merge_only:
         # 仅执行音频合并
@@ -456,7 +752,11 @@ def main():
             parser.error("--output_dir 在合并模式下是必需的")
 
         output_filename = f"merged_audio_{int(time.time())}.wav"
-        result = merge_audio_files(args.output_dir, output_filename, args.merge_gap)
+        audio_result = merge_audio_files(args.output_dir, output_filename, args.merge_gap)
+
+        # 同时生成 SRT 字幕
+        print("\n" + "="*80)
+        srt_result = generate_srt_files(args.output_dir, args.merge_gap)
         return
 
     # 检查必需的参数
@@ -520,10 +820,12 @@ def main():
 
     if total_audio > 0:
         print(f"\n💡 提示: 共有 {total_audio} 个音频文件可合并")
-        print("   运行以下命令合并音频:")
+        print("   运行以下命令合并音频和生成字幕:")
         print(f"   python {__file__} --merge_only --output_dir {args.output_dir}")
         print("   或使用脚本:")
         print(f"   ./gen/gen.sh merge")
+        print("\n   仅生成 SRT 字幕:")
+        print(f"   python {__file__} --srt_only --output_dir {args.output_dir}")
 
 if __name__ == '__main__':
     main()

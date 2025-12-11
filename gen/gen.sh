@@ -15,17 +15,19 @@ show_usage() {
     echo ""
     echo "步骤选项:"
     echo "  generate  - 仅生成音频文件"
-    echo "  merge     - 仅合并已生成的音频文件"
+    echo "  merge     - 仅合并已生成的音频文件和生成 SRT 字幕"
+    echo "  srt       - 仅生成 SRT 字幕文件"
     echo "  both      - 生成并合并（默认）"
     echo ""
     echo "示例:"
     echo "  $0           # 生成并合并"
     echo "  $0 generate  # 仅生成"
-    echo "  $0 merge     # 仅合并"
+    echo "  $0 merge     # 仅合并音频和生成字幕"
+    echo "  $0 srt       # 仅生成字幕"
 }
 
 # 检查参数
-if [[ "$STEP" != "generate" && "$STEP" != "merge" && "$STEP" != "both" ]]; then
+if [[ "$STEP" != "generate" && "$STEP" != "merge" && "$STEP" != "both" && "$STEP" != "srt" ]]; then
     echo "❌ 错误: 无效的步骤参数 '$STEP'"
     echo ""
     show_usage
@@ -63,13 +65,24 @@ if [[ "$STEP" == "generate" || "$STEP" == "both" ]]; then
     echo ""
 fi
 
-# 步骤2: 合并音频文件
+# 步骤2: 合并音频文件和生成 SRT 字幕
 if [[ "$STEP" == "merge" || "$STEP" == "both" ]]; then
-    echo "🔗 步骤2: 合并音频文件"
+    echo "🔗 步骤2: 合并音频文件和生成 SRT 字幕"
     echo "================================"
 
     PYTHONPATH="$REPO_ROOT" python "$REPO_ROOT/incremental_tts_generator.py" \
       --merge_only --output_dir "gen/audio" --merge_gap 10
+
+    echo ""
+fi
+
+# 步骤3: 仅生成 SRT 字幕
+if [[ "$STEP" == "srt" ]]; then
+    echo "📝 步骤: 生成 SRT 字幕文件"
+    echo "================================"
+
+    PYTHONPATH="$REPO_ROOT" python "$REPO_ROOT/incremental_tts_generator.py" \
+      --srt_only --output_dir "gen/audio" --merge_gap 10
 
     echo ""
 fi
